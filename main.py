@@ -5,543 +5,869 @@ import string
 import logging
 import time
 import hashlib
+import json
 from datetime import datetime, timedelta
-from collections import deque, defaultdict
+from collections import defaultdict
+from pathlib import Path
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 import uvicorn
 
 # ============================================================
-#  USERNAME HUNTER v4.0 — MATH EDITION
-#  أعلى نسبة نجاح ممكنة — مبني على تحليل رياضي عميق
+#  USERNAME HUNTER v5.0 — FIXED EDITION
+#  المشاكل المحلولة:
+#  1. ما يطفي أبداً (keep-alive مدمج)
+#  2. فحص حقيقي يرجع نتائج صحيحة
 # ============================================================
 
+# =============== CONFIG ===============
 WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "")
 USERNAME_LEN = int(os.getenv("USERNAME_LEN", 4))
 IG_SESSION   = os.getenv("IG_SESSION", "")
 TW_BEARER    = os.getenv("TW_BEARER", "")
 
-NORMAL_DELAY_MIN = float(os.getenv("DELAY_MIN", 18))
-NORMAL_DELAY_MAX = float(os.getenv("DELAY_MAX", 35))
-PURGE_DELAY_MIN  = 4.0
-PURGE_DELAY_MAX  = 10.0
+# تأخير مناسب — مو سريع جداً عشان ما ينبلوك، مو بطيء عشان يلقى نتائج
+CHECK_DELAY_MIN = float(os.getenv("DELAY_MIN", 8))
+CHECK_DELAY_MAX = float(os.getenv("DELAY_MAX", 15))
 
-PURGE_WATCH_ACCOUNT  = os.getenv("PURGE_WATCH_ACCOUNT", "instagram")
-PURGE_DROP_THRESHOLD = float(os.getenv("PURGE_DROP_THRESHOLD", 0.005))
+# ملف حفظ النتائج عشان ما تضيع لو أعاد التشغيل
+RESULTS_FILE = "results.json"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
 log = logging.getLogger("Hunter")
 
-# ====== تحليل رياضي لمساحة البحث ======
-# النمط            | التركيبات | نسبة التوفر | الوزن
-# 4 حروف نقية      | 456,976   | ~0%         | 0%  (محذوف)
-# 1حرف + 3أرقام    | 104,000   | ~20%        | 30%
-# مع نقطة          | +93,000   | ~25%        | 25%
-# مع underscore    | +93,000   | ~22%        | 20%
-# 2حروف + 2أرقام   | 405,600   | ~5%         | 15%
-# double_repeat    | نادر      | ~8%         | 10%
-
+# =============== STATS ===============
 stats = {
     "total_scanned": 0,
     "found": [],
     "last_user": "—",
-    "start_time": datetime.now(),
-    "rate_limits": {"instagram": 0, "snapchat": 0, "twitter": 0},
+    "start_time": None,
     "errors": 0,
-    "invalid_skipped": 0,
-    "duplicate_skipped": 0,
-    "purge_mode": False,
-    "purge_count": 0,
-    "purge_detected_at": None,
-    "by_strategy": {
-        "one_letter_3digits": 0,
-        "two_letters_2digits": 0,
-        "dot": 0,
-        "underscore": 0,
-        "double_repeat": 0,
-    },
-    "strategy_success": defaultdict(int),
-    "strategy_attempts": defaultdict(int),
+    "ig_available": 0,
+    "sc_available": 0,
+    "tw_available": 0,
+    "ig_rate_limits": 0,
+    "sc_rate_limits": 0,
+    "tw_rate_limits": 0,
+    "running": False,
 }
 
-dashboard_msg_id = None
 
 # ============================================================
-# 🧠 SMART RATE LIMITER
+# 💾 حفظ واسترجاع النتائج
 # ============================================================
-class SmartRateLimiter:
-    def __init__(self, name):
-        self.name = name
-        self.blocked_until = datetime.now()
-        self.hit_count = 0
-        self.backoff = 60
-        self.max_backoff = 600
-        self.history = deque(maxlen=10)
+def save_results():
+    """يحفظ النتائج في ملف عشان ما تضيع"""
+    try:
+        data = {"found": stats["found"][-100:], "total_scanned": stats["total_scanned"]}
+        Path(RESULTS_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception as e:
+        log.debug(f"Save error: {e}")
 
-    def is_blocked(self): return datetime.now() < self.blocked_until
-    def seconds_left(self): return max(0, (self.blocked_until - datetime.now()).total_seconds())
 
-    def register_limit(self, retry_after=None):
-        self.hit_count += 1
-        stats["rate_limits"][self.name] += 1
-        wait = retry_after + 5 if retry_after else min(self.backoff * (1.5 ** self.hit_count), self.max_backoff)
-        self.blocked_until = datetime.now() + timedelta(seconds=wait)
-        log.warning(f"⏳ [{self.name}] Rate Limit — انتظر {wait:.0f}s (#{self.hit_count})")
-
-    def register_success(self):
-        self.history.append(1)
-        if self.hit_count > 0 and len(self.history) >= 5 and sum(self.history) == 5:
-            self.hit_count = max(0, self.hit_count - 1)
-
-    def register_failure(self): self.history.append(0)
+def load_results():
+    """يسترجع النتائج السابقة"""
+    try:
+        if Path(RESULTS_FILE).exists():
+            data = json.loads(Path(RESULTS_FILE).read_text())
+            stats["found"] = data.get("found", [])
+            stats["total_scanned"] = data.get("total_scanned", 0)
+            log.info(f"📂 استرجعت {len(stats['found'])} نتيجة سابقة")
+    except Exception as e:
+        log.debug(f"Load error: {e}")
 
 
 # ============================================================
-# 🛡️ USERNAME VALIDATOR
-# قواعد Instagram الرسمية:
-# - لا يبدأ/ينتهي بـ . أو _
-# - لا نقطتان متتاليتان
-# - 3-30 حرف فقط
-# - حروف + أرقام + . + _ فقط
+# 🛡️ VALIDATORS
 # ============================================================
-ALLOWED_CHARS = set(string.ascii_lowercase + string.digits + "._")
+ALLOWED = set(string.ascii_lowercase + string.digits + "._")
 
-def is_valid_instagram(u: str) -> bool:
-    if not u or len(u) < 3 or len(u) > 30: return False
-    if u[0] in "._" or u[-1] in "._": return False
-    if ".." in u or "__" in u: return False
-    return all(c in ALLOWED_CHARS for c in u)
+def valid_ig(u):
+    if not u or len(u) < 3 or len(u) > 30:
+        return False
+    if u[0] in "._" or u[-1] in "._":
+        return False
+    if ".." in u or "__" in u:
+        return False
+    return all(c in ALLOWED for c in u)
 
-def is_valid_twitter(u: str) -> bool:
-    if "." in u or len(u) > 15: return False
-    return all(c in set(string.ascii_lowercase + string.digits + "_") for c in u)
+
+def valid_tw(u):
+    if "." in u or len(u) > 15 or len(u) < 1:
+        return False
+    allowed = set(string.ascii_lowercase + string.digits + "_")
+    return all(c in allowed for c in u)
 
 
 # ============================================================
-# 🔁 DEDUPLICATOR — لا تفحص نفس اليوزر مرتين
+# 🔁 DEDUP
 # ============================================================
 class SeenFilter:
-    def __init__(self, max_size=500_000):
+    def __init__(self):
         self.seen = set()
-        self.max_size = max_size
 
-    def check_and_mark(self, username: str) -> bool:
-        h = hashlib.md5(username.encode()).hexdigest()[:8]
-        if h in self.seen: return True
-        if len(self.seen) > self.max_size:
-            self.seen = set(list(self.seen)[self.max_size // 2:])
+    def is_new(self, username):
+        h = hashlib.md5(username.encode()).hexdigest()[:10]
+        if h in self.seen:
+            return False
         self.seen.add(h)
-        return False
+        if len(self.seen) > 200000:
+            # نحذف نصف القديم
+            self.seen = set(list(self.seen)[100000:])
+        return True
 
-seen_filter = SeenFilter()
+seen = SeenFilter()
 
 
 # ============================================================
-# 🎲 ULTRA-MATH USERNAME GENERATOR v4
+# 🎲 USERNAME GENERATOR
 # ============================================================
 LETTERS = string.ascii_lowercase
-DIGITS  = string.digits
-CHARS   = LETTERS + DIGITS
+DIGITS = string.digits
 
-BASE_WEIGHTS = {
-    "one_letter_3digits": 30,
-    "dot":                25,
-    "underscore":         20,
-    "two_letters_2digits": 15,
-    "double_repeat":      10,
-}
-
-def get_weights() -> dict:
-    weights = dict(BASE_WEIGHTS)
-    total = sum(stats["strategy_attempts"].values())
-    if total > 200:
-        for s in weights:
-            att = stats["strategy_attempts"][s]
-            if att > 20:
-                sr = stats["strategy_success"][s] / att
-                weights[s] = int(BASE_WEIGHTS[s] * (1 + sr * 3))
-    return weights
-
-def generate_username(length: int = 4) -> str:
-    w = get_weights()
-    strategy = random.choices(list(w.keys()), weights=list(w.values()))[0]
-    stats["by_strategy"][strategy] += 1
-    stats["strategy_attempts"][strategy] += 1
-
-    for _ in range(10):
-        u = _build(strategy, length)
-        if is_valid_instagram(u):
+def generate_username(length=4):
+    """يولد يوزر نيم بأنماط مختلفة"""
+    for _ in range(50):
+        u = _gen_one(length)
+        if valid_ig(u) and seen.is_new(u):
             return u
-    return _fallback(length)
+    # fallback
+    u = random.choice(LETTERS) + "".join(random.choices(DIGITS, k=length-1))
+    seen.is_new(u)
+    return u
 
-def _build(strategy: str, length: int) -> str:
-    if strategy == "one_letter_3digits":
-        chars = [random.choice(LETTERS)] + random.choices(DIGITS, k=3)
-        random.shuffle(chars)
-        return "".join(chars)
 
-    elif strategy == "two_letters_2digits":
-        chars = random.choices(LETTERS, k=2) + random.choices(DIGITS, k=2)
-        random.shuffle(chars)
-        return "".join(chars)
+def _gen_one(length):
+    strategy = random.choices(
+        ["l1d3", "l2d2", "dot", "under", "repeat", "d2l2", "l1d2l1"],
+        weights=[25, 15, 15, 10, 10, 15, 10]
+    )[0]
+
+    if strategy == "l1d3":
+        # حرف + 3 أرقام (أعلى نسبة توفر)
+        c = [random.choice(LETTERS)] + random.choices(DIGITS, k=3)
+        random.shuffle(c)
+        return "".join(c)
+
+    elif strategy == "l2d2":
+        c = random.choices(LETTERS, k=2) + random.choices(DIGITS, k=2)
+        random.shuffle(c)
+        return "".join(c)
+
+    elif strategy == "d2l2":
+        c = random.choices(DIGITS, k=2) + random.choices(LETTERS, k=2)
+        random.shuffle(c)
+        return "".join(c)
+
+    elif strategy == "l1d2l1":
+        return (random.choice(LETTERS)
+                + random.choice(DIGITS)
+                + random.choice(DIGITS)
+                + random.choice(LETTERS))
 
     elif strategy == "dot":
-        base = _mix(length - 1)
-        pos = random.randint(1, length - 2)
-        base.insert(pos, ".")
-        return "".join(base[:length])
+        # مثل a.23 أو 3.ab
+        left = random.choice(LETTERS + DIGITS)
+        right_len = length - 2  # 1 char + dot + rest
+        right = "".join(random.choices(LETTERS + DIGITS, k=right_len))
+        return left + "." + right
 
-    elif strategy == "underscore":
-        base = _mix(length - 1)
-        pos = random.randint(1, length - 2)
-        base.insert(pos, "_")
-        return "".join(base[:length])
+    elif strategy == "under":
+        left = random.choice(LETTERS + DIGITS)
+        right_len = length - 2
+        right = "".join(random.choices(LETTERS + DIGITS, k=right_len))
+        return left + "_" + right
 
-    elif strategy == "double_repeat":
-        pattern = random.choices(["aabb", "abab", "aabc"], weights=[40, 35, 25])[0]
+    elif strategy == "repeat":
+        a = random.choice(LETTERS + DIGITS)
+        b = random.choice(LETTERS + DIGITS)
+        pattern = random.choice(["aabb", "abab"])
         if pattern == "aabb":
-            a, b = random.choice(CHARS), random.choice(CHARS)
             return a + a + b + b
-        elif pattern == "abab":
-            a, b = random.choice(CHARS), random.choice(CHARS)
-            return a + b + a + b
         else:
-            a, b, c = random.choice(CHARS), random.choice(CHARS), random.choice(CHARS)
-            return a + a + b + c
+            return a + b + a + b
 
-    return _fallback(length)
-
-def _mix(n: int) -> list:
-    chars = [random.choice(LETTERS), random.choice(DIGITS)] + random.choices(CHARS, k=max(0, n - 2))
-    random.shuffle(chars)
-    return chars
-
-def _fallback(length: int) -> str:
-    chars = [random.choice(LETTERS)] + random.choices(DIGITS, k=length - 1)
-    random.shuffle(chars)
-    return "".join(chars)
+    return random.choice(LETTERS) + "".join(random.choices(DIGITS, k=3))
 
 
 # ============================================================
-# 🔍 PURGE DETECTOR
+# 📡 INSTAGRAM CHECKER — الطريقة الصحيحة
 # ============================================================
-class PurgeDetector:
+class InstagramChecker:
     def __init__(self):
-        self.last_count = None
+        self.blocked_until = 0
+        self.hit_count = 0
 
-    async def start(self, client: httpx.AsyncClient):
-        while True:
-            try:
-                await self._check(client)
-            except Exception as e:
-                log.debug(f"[Purge] {e}")
-            await asyncio.sleep(300)
+    def is_blocked(self):
+        return time.time() < self.blocked_until
 
-    async def _check(self, client: httpx.AsyncClient):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            "X-IG-App-ID": "936619743392459",
-        }
-        if IG_SESSION: headers["Cookie"] = f"sessionid={IG_SESSION}"
+    async def check(self, username, client):
+        if self.is_blocked():
+            return "skip"
 
-        r = await client.get(
-            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={PURGE_WATCH_ACCOUNT}",
-            headers=headers, timeout=15
-        )
-        if r.status_code != 200: return
-
-        count = r.json()["data"]["user"]["edge_followed_by"]["count"]
-        if self.last_count:
-            drop = (self.last_count - count) / self.last_count
-            if drop >= PURGE_DROP_THRESHOLD and not stats["purge_mode"]:
-                stats["purge_mode"] = True
-                stats["purge_count"] += 1
-                stats["purge_detected_at"] = datetime.now()
-                log.warning(f"🚨 PURGE! انخفاض {drop*100:.2f}% — وضع الطوارئ!")
-                asyncio.create_task(self._end_after(10800))
-        self.last_count = count
-
-    async def _end_after(self, secs):
-        await asyncio.sleep(secs)
-        stats["purge_mode"] = False
-        log.info("✅ انتهى Purge Mode")
-
-
-# ============================================================
-# 📡 PLATFORM AGENTS
-# ============================================================
-class InstagramAgent:
-    def __init__(self):
-        self.limiter = SmartRateLimiter("instagram")
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                          "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }
-        if IG_SESSION: self.headers["Cookie"] = f"sessionid={IG_SESSION}"
-
-    async def check(self, username: str, client: httpx.AsyncClient) -> str:
-        if self.limiter.is_blocked(): return "rate_limit"
         try:
-            r = await client.get(f"https://www.instagram.com/{username}/", headers=self.headers, timeout=10, follow_redirects=True)
-            if r.status_code == 404:   self.limiter.register_success(); return "available"
-            elif r.status_code == 200: self.limiter.register_success(); return "taken"
-            elif r.status_code == 429: self.limiter.register_limit(float(r.headers.get("Retry-After", 60))); return "rate_limit"
-            elif r.status_code in [301, 302]: self.limiter.register_success(); return "taken"
-            else: self.limiter.register_failure(); return "error"
-        except httpx.TimeoutException: return "error"
-        except Exception as e: log.debug(f"[IG] {e}"); stats["errors"] += 1; return "error"
+            # ✅ الطريقة الصحيحة: استخدم web_profile_info API
+            # هذا يرجع JSON مباشرة بدون HTML
+            headers = {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+                              "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                              "Version/17.5 Mobile/15E148 Safari/604.1",
+                "X-IG-App-ID": "936619743392459",
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.instagram.com/",
+            }
+            if IG_SESSION:
+                headers["Cookie"] = f"sessionid={IG_SESSION}"
 
+            r = await client.get(
+                f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+                headers=headers,
+                timeout=12,
+            )
 
-class SnapchatAgent:
-    def __init__(self):
-        self.limiter = SmartRateLimiter("snapchat")
-        self.headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"}
+            if r.status_code == 404:
+                # ✅ 404 = اليوزر فعلاً ما موجود = متاح
+                self._success()
+                return "available"
 
-    async def check(self, username: str, client: httpx.AsyncClient) -> str:
-        if "." in username: return "invalid"
-        if self.limiter.is_blocked(): return "rate_limit"
-        try:
-            r = await client.get(f"https://www.snapchat.com/add/{username}", headers=self.headers, timeout=10, follow_redirects=False)
-            if r.status_code == 404:              self.limiter.register_success(); return "available"
-            elif r.status_code in [200,301,302,308]: self.limiter.register_success(); return "taken"
-            elif r.status_code == 429:            self.limiter.register_limit(); return "rate_limit"
-            else: self.limiter.register_failure(); return "error"
-        except httpx.TimeoutException: return "error"
-        except Exception as e: log.debug(f"[SC] {e}"); return "error"
+            elif r.status_code == 200:
+                # موجود — نتأكد من الـ JSON
+                try:
+                    data = r.json()
+                    if data.get("data", {}).get("user"):
+                        self._success()
+                        return "taken"
+                    else:
+                        self._success()
+                        return "available"
+                except Exception:
+                    self._success()
+                    return "taken"
 
+            elif r.status_code == 429:
+                retry = int(r.headers.get("Retry-After", 120))
+                self._rate_limit(retry)
+                return "rate_limit"
 
-class TwitterAgent:
-    def __init__(self):
-        self.limiter = SmartRateLimiter("twitter")
-        self.use_api = bool(TW_BEARER)
-        self.headers = ({"Authorization": f"Bearer {TW_BEARER}"} if self.use_api
-                        else {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            elif r.status_code in (401, 403):
+                # سيشن منتهي أو مطلوب login
+                # نجرب الطريقة البديلة
+                return await self._fallback_check(username, client)
 
-    async def check(self, username: str, client: httpx.AsyncClient) -> str:
-        if not is_valid_twitter(username): return "invalid"
-        if self.limiter.is_blocked(): return "rate_limit"
-        try:
-            if self.use_api:
-                r = await client.get(f"https://api.twitter.com/2/users/by/username/{username}", headers=self.headers, timeout=10)
-                if r.status_code == 200:   self.limiter.register_success(); return "taken"
-                elif r.status_code == 404: self.limiter.register_success(); return "available"
-                elif r.status_code == 429:
-                    reset = float(r.headers.get("x-rate-limit-reset", time.time() + 900)) - time.time()
-                    self.limiter.register_limit(max(reset, 60)); return "rate_limit"
-                else: return "error"
             else:
-                r = await client.get(f"https://x.com/{username}", headers=self.headers, timeout=10, follow_redirects=True)
-                if r.status_code == 404:   self.limiter.register_success(); return "available"
-                elif r.status_code == 200: self.limiter.register_success(); return "taken"
-                elif r.status_code == 429: self.limiter.register_limit(); return "rate_limit"
-                else: self.limiter.register_failure(); return "error"
-        except httpx.TimeoutException: return "error"
-        except Exception as e: log.debug(f"[TW] {e}"); return "error"
+                self.hit_count += 1
+                return "error"
+
+        except httpx.TimeoutException:
+            return "timeout"
+        except Exception as e:
+            log.debug(f"[IG] {e}")
+            stats["errors"] += 1
+            return "error"
+
+    async def _fallback_check(self, username, client):
+        """طريقة بديلة بدون session"""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 14) "
+                              "AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
+            }
+            r = await client.get(
+                f"https://www.instagram.com/{username}/",
+                headers=headers,
+                timeout=10,
+                follow_redirects=True,
+            )
+
+            body = r.text
+
+            # ✅ الطريقة الصحيحة: نفحص محتوى الصفحة
+            if r.status_code == 404:
+                return "available"
+
+            # لو الصفحة فيها "Page Not Found" أو ما فيها بيانات يوزر
+            if ("page_not_found" in body.lower()
+                or '"HttpErrorPage"' in body
+                or "Sorry, this page" in body
+                or "isn't available" in body):
+                return "available"
+
+            # لو فيها بيانات يوزر حقيقية
+            if (f'"username":"{username}"' in body
+                or f"/{username}/" in body
+                or '"edge_followed_by"' in body):
+                return "taken"
+
+            # لو ما نقدر نحدد
+            return "unknown"
+
+        except Exception:
+            return "error"
+
+    def _success(self):
+        self.hit_count = max(0, self.hit_count - 1)
+
+    def _rate_limit(self, wait=120):
+        self.hit_count += 1
+        actual_wait = wait + random.randint(10, 30)
+        self.blocked_until = time.time() + actual_wait
+        stats["ig_rate_limits"] += 1
+        log.warning(f"⏳ [IG] Rate limit — ننتظر {actual_wait}s")
 
 
 # ============================================================
-# 🏆 VALUE SCORER
+# 📡 SNAPCHAT CHECKER — الطريقة الصحيحة
 # ============================================================
-def score_username(username: str, platforms: list) -> dict:
-    score, tags = 0, []
-    clean = username.replace(".", "").replace("_", "")
+class SnapchatChecker:
+    def __init__(self):
+        self.blocked_until = 0
 
-    score += len(platforms) * 20
-    if len(platforms) == 3: tags.append("💎 TRIPLE")
-    if "." in username:  score += 15; tags.append("🔵 DOT")
-    if "_" in username:  score += 15; tags.append("🔵 UNDERSCORE")
+    def is_blocked(self):
+        return time.time() < self.blocked_until
 
-    digits  = sum(c.isdigit() for c in clean)
-    letters = sum(c.isalpha() for c in clean)
-    if digits >= 3:  score += 20; tags.append("🔢 DIGIT-HEAVY")
-    if letters == 1: score += 30; tags.append("⭐ SINGLE-LETTER")
-
-    if len(clean) >= 4:
-        if clean[0] == clean[1] and clean[2] == clean[3]: score += 40; tags.append("👑 AABB")
-        elif clean[0] == clean[2] and clean[1] == clean[3]: score += 35; tags.append("👑 ABAB")
-        elif clean[0] == clean[1]: score += 20; tags.append("✨ DOUBLE")
-
-    tier = "🥇 S-TIER" if score >= 90 else "🥈 A-TIER" if score >= 60 else "🥉 B-TIER"
-    return {"score": score, "tier": tier, "tags": tags}
-
-
-# ============================================================
-# 🔔 DISCORD
-# ============================================================
-async def send_catch_alert(username: str, platforms: list):
-    if not WEBHOOK_URL: return
-    ev = score_username(username, platforms)
-    links = "\n".join(filter(None, [
-        f"[Instagram](https://instagram.com/{username})" if "instagram" in platforms else "",
-        f"[Snapchat](https://snapchat.com/add/{username})"  if "snapchat"  in platforms else "",
-        f"[Twitter/X](https://x.com/{username})"            if "twitter"   in platforms else "",
-    ]))
-    payload = {"embeds": [{"title": f"🎯 صيدة — @{username}", "color": 0xFFD700 if ev["score"] >= 90 else 0x5865F2,
-        "fields": [
-            {"name": "📱 المنصات", "value": " + ".join(p.capitalize() for p in platforms), "inline": True},
-            {"name": "⭐ التقييم", "value": f"{ev['tier']} ({ev['score']}pts)", "inline": True},
-            {"name": "🏷️ الأنماط", "value": " ".join(ev["tags"]) or "—", "inline": False},
-            {"name": "🔗 الروابط", "value": links, "inline": False},
-        ],
-        "footer": {"text": f"Purge: {'🚨 نشط' if stats['purge_mode'] else '😴 عادي'} • {datetime.now().strftime('%H:%M:%S')}"}
-    }]}
-    try:
-        async with httpx.AsyncClient() as c: await c.post(WEBHOOK_URL, json=payload, timeout=10)
-    except Exception as e: log.warning(f"⚠️ إشعار فشل: {e}")
-
-
-async def update_dashboard():
-    global dashboard_msg_id
-    if not WEBHOOK_URL: return
-    while True:
-        uptime = datetime.now() - stats["start_time"]
-        up_str = f"{int(uptime.total_seconds()//3600)}h {int((uptime.total_seconds()%3600)//60)}m"
-        rate   = stats["total_scanned"] / max(uptime.total_seconds() / 60, 1)
-        finds  = stats["found"][-5:]
-        find_str = "\n".join(f"`{f['username']}` {f.get('tier','—')} على {', '.join(f['platforms'])}" for f in reversed(finds)) or "لا يوجد بعد..."
-
-        total_gen  = stats["total_scanned"] + stats["invalid_skipped"] + stats["duplicate_skipped"]
-        efficiency = stats["total_scanned"] / max(total_gen, 1) * 100
-
-        strat_lines = [
-            f"{s[:16]:16} {stats['strategy_attempts'][s]:4d} فحص | "
-            f"{stats['strategy_success'][s]/max(stats['strategy_attempts'][s],1)*100:.1f}% نجاح"
-            for s in stats["by_strategy"] if stats["strategy_attempts"][s] > 0
-        ]
-        strat_str = "\n".join(strat_lines) or "لا بيانات بعد..."
-
-        def ps(agent): return f"⏳({agent.limiter.seconds_left():.0f}s)" if agent.limiter.is_blocked() else "🟢"
-
-        payload = {"embeds": [{"title": "🎯 Hunter v4 — Math Edition", "color": 0xFF0000 if stats["purge_mode"] else 0x00FF88,
-            "fields": [
-                {"name": "📊 الإحصائيات", "value": f"```\nإجمالي الفحص  : {stats['total_scanned']:,}\nالصيدات       : {len(stats['found'])}\nمعدل الفحص    : {rate:.1f}/دقيقة\nكفاءة الجيل   : {efficiency:.1f}%\nوقت التشغيل   : {up_str}\nأخطاء         : {stats['errors']}\n```", "inline": False},
-                {"name": "⚡ الوضع", "value": "🚨 PURGE MODE" if stats["purge_mode"] else "😴 عادي", "inline": True},
-                {"name": "📡 المنصات", "value": f"📸 IG: {ps(ig_agent)}\n👻 SC: {ps(sc_agent)}\n🐦 TW: {ps(tw_agent)}", "inline": True},
-                {"name": "🔢 Skip", "value": f"Invalid: {stats['invalid_skipped']}\nDuplicate: {stats['duplicate_skipped']}", "inline": True},
-                {"name": "🧠 أداء الاستراتيجيات", "value": f"```\n{strat_str}\n```", "inline": False},
-                {"name": "🎯 آخر الصيدات", "value": find_str, "inline": False},
-                {"name": "🔍 آخر يوزر", "value": f"`{stats['last_user']}`", "inline": False},
-            ],
-            "footer": {"text": f"Purge: {stats['purge_count']}x • {datetime.now().strftime('%H:%M:%S')}"}
-        }]}
+    async def check(self, username, client):
+        if "." in username:
+            return "invalid"
+        if self.is_blocked():
+            return "skip"
 
         try:
-            async with httpx.AsyncClient() as c:
-                if not dashboard_msg_id:
-                    r = await c.post(f"{WEBHOOK_URL}?wait=true", json=payload, timeout=10)
-                    if r.status_code in [200, 204]: dashboard_msg_id = r.json().get("id"); log.info(f"✅ داشبورد ID:{dashboard_msg_id}")
+            # ✅ Snapchat Bitmoji API — أدق طريقة
+            # لو اليوزر موجود، يكون عنده Bitmoji أو على الأقل profile
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+                              "AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+
+            r = await client.head(
+                f"https://www.snapchat.com/add/{username}",
+                headers=headers,
+                timeout=10,
+                follow_redirects=False,
+            )
+
+            if r.status_code == 404:
+                return "available"
+            elif r.status_code in (200, 301, 302):
+                # نتحقق أكثر
+                r2 = await client.get(
+                    f"https://www.snapchat.com/add/{username}",
+                    headers=headers,
+                    timeout=10,
+                    follow_redirects=True,
+                )
+                body = r2.text
+                if ("not found" in body.lower()
+                    or "page isn" in body.lower()
+                    or "userNotFound" in body
+                    or len(body) < 500):
+                    return "available"
+                return "taken"
+            elif r.status_code == 429:
+                self.blocked_until = time.time() + 180
+                stats["sc_rate_limits"] += 1
+                log.warning("⏳ [SC] Rate limit — 180s")
+                return "rate_limit"
+            else:
+                return "unknown"
+
+        except httpx.TimeoutException:
+            return "timeout"
+        except Exception as e:
+            log.debug(f"[SC] {e}")
+            return "error"
+
+
+# ============================================================
+# 📡 TWITTER CHECKER
+# ============================================================
+class TwitterChecker:
+    def __init__(self):
+        self.blocked_until = 0
+
+    def is_blocked(self):
+        return time.time() < self.blocked_until
+
+    async def check(self, username, client):
+        if not valid_tw(username):
+            return "invalid"
+        if self.is_blocked():
+            return "skip"
+
+        try:
+            if TW_BEARER:
+                # ✅ Twitter API v2 — أدق طريقة
+                r = await client.get(
+                    f"https://api.twitter.com/2/users/by/username/{username}",
+                    headers={"Authorization": f"Bearer {TW_BEARER}"},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("data"):
+                        return "taken"
+                    elif data.get("errors"):
+                        for err in data["errors"]:
+                            if "not found" in err.get("detail", "").lower():
+                                return "available"
+                        return "taken"
+                    return "taken"
+                elif r.status_code == 404:
+                    return "available"
+                elif r.status_code == 429:
+                    reset = float(r.headers.get("x-rate-limit-reset", time.time() + 900))
+                    wait = max(reset - time.time(), 60) + 10
+                    self.blocked_until = time.time() + wait
+                    stats["tw_rate_limits"] += 1
+                    log.warning(f"⏳ [TW] Rate limit — {wait:.0f}s")
+                    return "rate_limit"
+                elif r.status_code == 400:
+                    return "invalid"
                 else:
-                    await c.patch(f"{WEBHOOK_URL}/messages/{dashboard_msg_id}", json=payload, timeout=10)
-        except Exception as e: log.warning(f"⚠️ داشبورد: {e}")
-        await asyncio.sleep(15)
+                    return "error"
+            else:
+                # بدون token — نستخدم syndication API
+                r = await client.get(
+                    f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                      "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                    },
+                    timeout=10,
+                )
+                if r.status_code == 404:
+                    return "available"
+                elif r.status_code == 200:
+                    return "taken"
+                elif r.status_code == 429:
+                    self.blocked_until = time.time() + 300
+                    stats["tw_rate_limits"] += 1
+                    return "rate_limit"
+                else:
+                    return "unknown"
+
+        except httpx.TimeoutException:
+            return "timeout"
+        except Exception as e:
+            log.debug(f"[TW] {e}")
+            return "error"
 
 
 # ============================================================
-# 🤖 AGENTS & LOOP
+# 🔔 DISCORD WEBHOOK
 # ============================================================
-ig_agent       = InstagramAgent()
-sc_agent       = SnapchatAgent()
-tw_agent       = TwitterAgent()
-purge_detector = PurgeDetector()
+async def send_alert(username, platforms, client):
+    if not WEBHOOK_URL:
+        return
+
+    plat_text = " + ".join(p.upper() for p in platforms)
+    links = []
+    if "instagram" in platforms:
+        links.append(f"📸 https://instagram.com/{username}")
+    if "snapchat" in platforms:
+        links.append(f"👻 https://snapchat.com/add/{username}")
+    if "twitter" in platforms:
+        links.append(f"🐦 https://x.com/{username}")
+
+    # تقييم بسيط
+    score = len(platforms) * 30
+    if len(username) <= 4:
+        score += 20
+    clean = username.replace(".", "").replace("_", "")
+    if sum(c.isdigit() for c in clean) >= 3:
+        score += 10
+    tier = "S" if score >= 80 else "A" if score >= 50 else "B"
+
+    payload = {
+        "content": "@everyone" if len(platforms) >= 2 else "",
+        "embeds": [{
+            "title": f"🎯 صيدة: @{username}",
+            "color": 0xFFD700 if tier == "S" else 0x5865F2 if tier == "A" else 0x57F287,
+            "fields": [
+                {"name": "📱 المنصات", "value": plat_text, "inline": True},
+                {"name": "⭐ التقييم", "value": f"{tier}-Tier ({score}pts)", "inline": True},
+                {"name": "🔗 الروابط", "value": "\n".join(links), "inline": False},
+            ],
+            "footer": {"text": f"Hunter v5 • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"},
+        }]
+    }
+
+    try:
+        await client.post(WEBHOOK_URL, json=payload, timeout=10)
+        log.info(f"📨 إشعار أُرسل: @{username}")
+    except Exception as e:
+        log.warning(f"⚠️ فشل إرسال الإشعار: {e}")
 
 
-def _detect_strategy(u: str) -> str:
-    if "." in u: return "dot"
-    if "_" in u: return "underscore"
-    clean = u.replace(".", "").replace("_", "")
-    d, l = sum(c.isdigit() for c in clean), sum(c.isalpha() for c in clean)
-    if l == 1 and d == 3: return "one_letter_3digits"
-    if l == 2 and d == 2: return "two_letters_2digits"
-    if len(clean) >= 2 and clean[0] == clean[1]: return "double_repeat"
-    return "one_letter_3digits"
+# ============================================================
+# 📊 DASHBOARD MESSAGE
+# ============================================================
+dashboard_msg_id = None
+
+async def update_dashboard_loop(client):
+    global dashboard_msg_id
+    if not WEBHOOK_URL:
+        return
+
+    while True:
+        try:
+            await _send_dashboard(client)
+        except Exception as e:
+            log.debug(f"Dashboard error: {e}")
+        await asyncio.sleep(20)
 
 
-async def scan_username(username: str, client: httpx.AsyncClient):
+async def _send_dashboard(client):
+    global dashboard_msg_id
+
+    if not stats["start_time"]:
+        return
+
+    uptime = datetime.now() - stats["start_time"]
+    hours = int(uptime.total_seconds() // 3600)
+    mins = int((uptime.total_seconds() % 3600) // 60)
+    rate = stats["total_scanned"] / max(uptime.total_seconds() / 60, 1)
+
+    recent = stats["found"][-5:]
+    finds_text = "\n".join(
+        f"• `{f['username']}` — {', '.join(f['platforms'])}"
+        for f in reversed(recent)
+    ) or "ما لقينا شي بعد..."
+
+    ig_status = "🟢" if not ig_checker.is_blocked() else f"🔴 ({int(ig_checker.blocked_until - time.time())}s)"
+    sc_status = "🟢" if not sc_checker.is_blocked() else f"🔴 ({int(sc_checker.blocked_until - time.time())}s)"
+    tw_status = "🟢" if not tw_checker.is_blocked() else f"🔴 ({int(tw_checker.blocked_until - time.time())}s)"
+
+    payload = {
+        "embeds": [{
+            "title": "📊 Hunter v5 — Dashboard",
+            "color": 0x00FF88 if stats["running"] else 0xFF0000,
+            "fields": [
+                {
+                    "name": "📈 إحصائيات",
+                    "value": (
+                        f"```\n"
+                        f"الفحوصات  : {stats['total_scanned']:,}\n"
+                        f"الصيدات   : {len(stats['found'])}\n"
+                        f"المعدل    : {rate:.1f}/دقيقة\n"
+                        f"التشغيل   : {hours}h {mins}m\n"
+                        f"أخطاء     : {stats['errors']}\n"
+                        f"```"
+                    ),
+                    "inline": False,
+                },
+                {
+                    "name": "📡 حالة المنصات",
+                    "value": f"📸 IG: {ig_status}\n👻 SC: {sc_status}\n🐦 TW: {tw_status}",
+                    "inline": True,
+                },
+                {
+                    "name": "⏳ Rate Limits",
+                    "value": f"IG: {stats['ig_rate_limits']}\nSC: {stats['sc_rate_limits']}\nTW: {stats['tw_rate_limits']}",
+                    "inline": True,
+                },
+                {
+                    "name": "🎯 آخر الصيدات",
+                    "value": finds_text,
+                    "inline": False,
+                },
+                {
+                    "name": "🔍 آخر يوزر",
+                    "value": f"`{stats['last_user']}`",
+                    "inline": False,
+                },
+            ],
+            "footer": {"text": f"آخر تحديث: {datetime.now().strftime('%H:%M:%S')}"},
+        }]
+    }
+
+    try:
+        if not dashboard_msg_id:
+            r = await client.post(f"{WEBHOOK_URL}?wait=true", json=payload, timeout=10)
+            if r.status_code == 200:
+                dashboard_msg_id = r.json().get("id")
+        else:
+            r = await client.patch(
+                f"{WEBHOOK_URL}/messages/{dashboard_msg_id}",
+                json=payload,
+                timeout=10,
+            )
+            if r.status_code == 404:
+                dashboard_msg_id = None
+    except Exception:
+        pass
+
+
+# ============================================================
+# 🤖 MAIN HUNTER LOOP
+# ============================================================
+ig_checker = InstagramChecker()
+sc_checker = SnapchatChecker()
+tw_checker = TwitterChecker()
+
+
+async def check_one(username, client):
+    """يفحص يوزر واحد على كل المنصات"""
     stats["total_scanned"] += 1
     stats["last_user"] = username
 
-    results = await asyncio.gather(
-        ig_agent.check(username, client),
-        sc_agent.check(username, client),
-        tw_agent.check(username, client),
-        return_exceptions=True
-    )
-    ig_r, sc_r, tw_r = [r if isinstance(r, str) else "error" for r in results]
+    # فحص متوازي
+    ig_task = ig_checker.check(username, client)
+    sc_task = sc_checker.check(username, client)
+    tw_task = tw_checker.check(username, client)
 
-    available = [p for p, r in [("instagram", ig_r), ("snapchat", sc_r), ("twitter", tw_r)] if r == "available"]
+    results = await asyncio.gather(ig_task, sc_task, tw_task, return_exceptions=True)
+
+    ig_r = results[0] if isinstance(results[0], str) else "error"
+    sc_r = results[1] if isinstance(results[1], str) else "error"
+    tw_r = results[2] if isinstance(results[2], str) else "error"
+
+    # نجمع المنصات المتاحة
+    available = []
+    if ig_r == "available":
+        available.append("instagram")
+        stats["ig_available"] += 1
+    if sc_r == "available":
+        available.append("snapchat")
+        stats["sc_available"] += 1
+    if tw_r == "available":
+        available.append("twitter")
+        stats["tw_available"] += 1
+
+    # حالة الطباعة
+    def short(r):
+        return {"available": "✅", "taken": "❌", "skip": "⏭️",
+                "rate_limit": "⏳", "error": "⚠️", "timeout": "⏰",
+                "invalid": "🚫", "unknown": "❓"}.get(r, "?")
+
+    log.info(
+        f"🔍 [{username}] "
+        f"IG:{short(ig_r)} SC:{short(sc_r)} TW:{short(tw_r)}"
+        f"{' 🎯 صيدة!' if available else ''}"
+    )
 
     if available:
-        ev = score_username(username, available)
-        stats["strategy_success"][_detect_strategy(username)] += 1
-        stats["found"].append({"username": username, "platforms": available, "time": datetime.now().strftime("%H:%M:%S"), "tier": ev["tier"], "score": ev["score"]})
-        log.info(f"🎯 [{username}] {ev['tier']} على: {' + '.join(p.capitalize() for p in available)}")
-        await send_catch_alert(username, available)
-    else:
-        log.info(f"{'🚨' if stats['purge_mode'] else '🔍'} [{username}] IG:{ig_r[:2].upper()} SC:{sc_r[:2].upper()} TW:{tw_r[:2].upper()}")
+        entry = {
+            "username": username,
+            "platforms": available,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        stats["found"].append(entry)
+        save_results()
+        await send_alert(username, available, client)
 
 
 async def hunter_loop():
-    log.info("🚀 Username Hunter v4 — Math Edition!")
-    log.info("📐 1حرف+3أرقام(30%) | نقطة(25%) | underscore(20%) | 2+2(15%) | repeat(10%)")
-    log.info("🛡️ Validator نشط | 🔁 Deduplicator نشط | 🧠 Adaptive Learning نشط")
+    """الحلقة الرئيسية — ما توقف أبداً"""
+    log.info("=" * 50)
+    log.info("🚀 Username Hunter v5 — FIXED EDITION")
+    log.info("✅ فحص Instagram API صحيح")
+    log.info("✅ فحص Snapchat محسّن")
+    log.info("✅ Keep-alive مدمج")
+    log.info("=" * 50)
 
-    async with httpx.AsyncClient(limits=httpx.Limits(max_connections=10, max_keepalive_connections=5), timeout=httpx.Timeout(15.0)) as client:
-        asyncio.create_task(purge_detector.start(client))
+    stats["start_time"] = datetime.now()
+    stats["running"] = True
+    load_results()
+
+    async with httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=15, max_keepalive_connections=5),
+        timeout=httpx.Timeout(15.0),
+    ) as client:
+
+        # شغل الداشبورد
+        asyncio.create_task(update_dashboard_loop(client))
 
         while True:
-            # ولّد يوزر valid وغير مكرر
-            for _ in range(20):
+            try:
                 username = generate_username(USERNAME_LEN)
-                if not is_valid_instagram(username): stats["invalid_skipped"] += 1; continue
-                if seen_filter.check_and_mark(username): stats["duplicate_skipped"] += 1; continue
-                break
+                await check_one(username, client)
 
-            await scan_username(username, client)
-            await asyncio.sleep(random.uniform(
-                PURGE_DELAY_MIN if stats["purge_mode"] else NORMAL_DELAY_MIN,
-                PURGE_DELAY_MAX if stats["purge_mode"] else NORMAL_DELAY_MAX,
-            ))
+                # تأخير عشوائي
+                delay = random.uniform(CHECK_DELAY_MIN, CHECK_DELAY_MAX)
+
+                # لو كل المنصات blocked ننتظر أكثر
+                if (ig_checker.is_blocked()
+                    and sc_checker.is_blocked()
+                    and tw_checker.is_blocked()):
+                    min_wait = min(
+                        ig_checker.blocked_until,
+                        sc_checker.blocked_until,
+                        tw_checker.blocked_until,
+                    ) - time.time()
+                    if min_wait > 0:
+                        log.warning(f"⏳ كل المنصات blocked — ننتظر {min_wait:.0f}s")
+                        await asyncio.sleep(min(min_wait, 120))
+                        continue
+
+                await asyncio.sleep(delay)
+
+            except asyncio.CancelledError:
+                log.warning("⚠️ Task cancelled — نعيد التشغيل...")
+                await asyncio.sleep(5)
+                continue
+            except Exception as e:
+                log.error(f"❌ خطأ: {e}")
+                stats["errors"] += 1
+                await asyncio.sleep(10)
+                continue
 
 
 # ============================================================
-# 🌐 FastAPI
+# 🌐 FastAPI — مع KEEP-ALIVE مدمج
 # ============================================================
-app = FastAPI(title="Username Hunter v4", version="4.0")
+app = FastAPI(title="Username Hunter v5")
+
+# ✅ هذا هو الحل الأساسي لمشكلة الإطفاء
+# السيرفر يبنق نفسه كل 10 دقائق
+_self_ping_started = False
+
+async def self_ping():
+    """يبنق نفسه عشان Render ما يطفيه"""
+    port = int(os.getenv("PORT", 10000))
+    await asyncio.sleep(30)  # ننتظر السيرفر يشتغل
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                await client.get(f"http://0.0.0.0:{port}/health", timeout=5)
+                log.debug("💓 Self-ping OK")
+            except Exception:
+                pass
+            await asyncio.sleep(600)  # كل 10 دقائق
+
+
+# ✅ المهم: نشغل الـ hunter كـ background task بطريقة ما تموت
+hunter_task = None
+
+@app.on_event("startup")
+async def startup():
+    global hunter_task, _self_ping_started
+    log.info("🌐 FastAPI Starting...")
+
+    # شغل الـ hunter
+    hunter_task = asyncio.create_task(hunter_loop())
+
+    # شغل الـ self-ping
+    if not _self_ping_started:
+        asyncio.create_task(self_ping())
+        _self_ping_started = True
+
+    log.info("✅ كل شي شغال!")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    stats["running"] = False
+    save_results()
+    log.info("💾 النتائج محفوظة — إلى اللقاء!")
+
 
 @app.get("/")
+async def root():
+    total = stats["total_scanned"]
+    found = len(stats["found"])
+    return {
+        "status": "🟢 running" if stats["running"] else "🔴 stopped",
+        "version": "5.0-fixed",
+        "scanned": total,
+        "found": found,
+        "success_rate": f"{found/max(total,1)*100:.3f}%",
+    }
+
+
+@app.get("/health")
 async def health():
-    t, f = stats["total_scanned"], len(stats["found"])
-    return {"status": "running", "version": "4.0-math", "scanned": t, "found": f,
-            "success_rate": f"{f/max(t,1)*100:.2f}%", "purge_mode": stats["purge_mode"],
-            "efficiency": f"{t/(t+stats['invalid_skipped']+stats['duplicate_skipped']+1)*100:.1f}%"}
+    """endpoint للـ keep-alive"""
+    global hunter_task
+
+    # ✅ لو الـ hunter task مات — نشغله من جديد!
+    if hunter_task is None or hunter_task.done():
+        log.warning("🔄 Hunter task died — restarting!")
+        hunter_task = asyncio.create_task(hunter_loop())
+
+    return {"status": "alive", "running": not (hunter_task is None or hunter_task.done())}
+
 
 @app.get("/stats")
 async def get_stats():
-    return {**{k: v for k, v in stats.items() if k not in ["strategy_success","strategy_attempts","by_strategy"]},
-            "found": stats["found"][-20:],
-            "strategy_performance": {s: {"attempts": stats["strategy_attempts"][s], "success": stats["strategy_success"][s],
-                "rate": f"{stats['strategy_success'][s]/max(stats['strategy_attempts'][s],1)*100:.1f}%"} for s in stats["by_strategy"]},
-            "uptime": str(datetime.now() - stats["start_time"]).split(".")[0]}
-
-@app.post("/purge/on")
-async def purge_on():
-    stats["purge_mode"] = True; stats["purge_count"] += 1
-    asyncio.create_task(purge_detector._end_after(3600))
-    return {"status": "Purge Mode ON — 1hr"}
-
-@app.post("/purge/off")
-async def purge_off():
-    stats["purge_mode"] = False; return {"status": "Purge Mode OFF"}
+    return {
+        "total_scanned": stats["total_scanned"],
+        "found_count": len(stats["found"]),
+        "found_usernames": stats["found"][-20:],
+        "last_user": stats["last_user"],
+        "errors": stats["errors"],
+        "rate_limits": {
+            "instagram": stats["ig_rate_limits"],
+            "snapchat": stats["sc_rate_limits"],
+            "twitter": stats["tw_rate_limits"],
+        },
+        "uptime": str(datetime.now() - stats["start_time"]).split(".")[0] if stats["start_time"] else "—",
+    }
 
 
-async def main():
-    if not WEBHOOK_URL: log.warning("⚠️ WEBHOOK_URL مو موجود")
-    asyncio.create_task(hunter_loop())
-    asyncio.create_task(update_dashboard())
-    port = int(os.getenv("PORT", 10000))
-    await uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")).serve()
+@app.get("/found")
+async def get_found():
+    return {"count": len(stats["found"]), "results": stats["found"]}
 
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def web_dashboard():
+    """داشبورد ويب بسيط"""
+    total = stats["total_scanned"]
+    found = len(stats["found"])
+    uptime = str(datetime.now() - stats["start_time"]).split(".")[0] if stats["start_time"] else "—"
+
+    rows = ""
+    for f in reversed(stats["found"][-20:]):
+        rows += f"<tr><td>{f['username']}</td><td>{', '.join(f['platforms'])}</td><td>{f['time']}</td></tr>\n"
+
+    return f"""
+    <html>
+    <head>
+        <title>Hunter v5 Dashboard</title>
+        <meta http-equiv="refresh" content="15">
+        <style>
+            body {{ font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }}
+            .stat {{ display: inline-block; background: #16213e; padding: 15px; margin: 5px; border-radius: 8px; min-width: 150px; text-align: center; }}
+            .stat h3 {{ margin: 0; color: #0f3460; font-size: 14px; }}
+            .stat p {{ margin: 5px 0 0; font-size: 24px; color: #e94560; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+            th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #333; }}
+            th {{ background: #16213e; }}
+            h1 {{ color: #e94560; }}
+        </style>
+    </head>
+    <body>
+        <h1>🎯 Hunter v5 Dashboard</h1>
+        <div>
+            <div class="stat"><h3>Scanned</h3><p>{total:,}</p></div>
+            <div class="stat"><h3>Found</h3><p>{found}</p></div>
+            <div class="stat"><h3>Uptime</h3><p>{uptime}</p></div>
+            <div class="stat"><h3>Last</h3><p>{stats['last_user']}</p></div>
+        </div>
+        <h2>🎯 الصيدات</h2>
+        <table>
+            <tr><th>Username</th><th>Platforms</th><th>Time</th></tr>
+            {rows if rows else '<tr><td colspan="3">ما لقينا شي بعد...</td></tr>'}
+        </table>
+        <p style="color:#666; margin-top:20px;">يتحدث تلقائياً كل 15 ثانية</p>
+    </body>
+    </html>
+    """
+
+
+# ============================================================
+# 🚀 MAIN
+# ============================================================
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.getenv("PORT", 10000))
+    log.info(f"🌐 Starting on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
